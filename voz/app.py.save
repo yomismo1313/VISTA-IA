@@ -24,6 +24,7 @@ import numpy as np
 import requests
 from aiohttp import web
 import aiohttp_cors
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from _vista_config import cfg
@@ -50,19 +51,6 @@ log.info(f"Gateway: {GATEWAY_URL}")
 log.info(f"Referencia: {VOZ_REFERENCIA or '(no configurada)'}")
 log.info(f"XTTS max chars por frase: {XTTS_MAX_CHARS}")
 
-# ── DEVICE (CPU/GPU) ──
-try:
-    import torch
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    if DEVICE == "cuda":
-        log.info(f"🖥️  Dispositivo: CUDA ({torch.cuda.get_device_name(0)}) "
-                 f"· torch {torch.__version__} · CUDA {torch.version.cuda}")
-    else:
-        log.info(f"🖥️  Dispositivo: CPU · torch {torch.__version__}")
-except Exception as e:
-    DEVICE = "cpu"
-    log.warning(f"⚠️ torch no disponible ({e}); se usará CPU")
-
 # ── CARGA DE MODELOS ──
 whisper_model = None
 try:
@@ -78,18 +66,18 @@ xtts_ok = False
 xtts_last_error = None
 
 try:
-    log.info(f"🎙️  Cargando XTTS: {XTTS_MODEL_NAME} (gpu={DEVICE == 'cuda'})...")
-    import torchaudio  # noqa: F401  (necesario para que TTS cargue)
+    log.info(f"🎙️  Cargando XTTS: {XTTS_MODEL_NAME}...")
+    import torch
+    import torchaudio  # noqa: F401
     from TTS.api import TTS
-    xtts_engine = TTS(XTTS_MODEL_NAME, gpu=(DEVICE == "cuda"))
+    xtts_engine = TTS(XTTS_MODEL_NAME)
     xtts_ok = True
     log.info("✅ XTTS listo (voz clonada)")
 except Exception as e:
-    msg = f"{type(e).__name__}: {e}"
-    log.warning(f"❌ XTTS no se pudo cargar ({msg}), se usará espeak")
+    log.warning(f"❌ XTTS no se pudo cargar ({e}), se usará espeak")
     xtts_engine = None
     xtts_ok = False
-    xtts_last_error = msg
+    xtts_last_error = str(e)
 
 if xtts_ok:
     if VOZ_REFERENCIA and Path(VOZ_REFERENCIA).exists():
@@ -319,7 +307,6 @@ async def handle_health(request):
     return web.json_response({
         "ok": True,
         "service": "voz",
-        "device": DEVICE,
         "xtts_cargado": xtts_engine is not None,
         "xtts_ok": xtts_ok,
         "xtts_last_error": xtts_last_error,
@@ -398,7 +385,7 @@ def main():
         cors.add(route)
 
     log.info(f"🗣️  voz/ escuchando en :{PORT}  "
-             f"(device={DEVICE}, XTTS={'✅' if xtts_ok else '❌ espeak'})")
+             f"(XTTS={'✅' if xtts_ok else '❌ espeak'})")
     web.run_app(app, host="0.0.0.0", port=PORT, print=None)
 
 
