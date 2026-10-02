@@ -1,0 +1,8 @@
+aiohttp>=3.9
+requests
+numpy
+scipy
+soundfile
+openai-whisper
+torch
+coqui-tts

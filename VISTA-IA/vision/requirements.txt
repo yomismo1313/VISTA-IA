@@ -1,0 +1,4 @@
+aiohttp>=3.9
+requests
+ultralytics
+opencv-python-headless

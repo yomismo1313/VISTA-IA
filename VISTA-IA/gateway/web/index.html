@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VISTA · Control</title>
+<link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+<div class="card">
+  <h1>🔊 VISTA · Panel de control</h1>
+  <div class="sub" id="ips">cargando…</div>
+  <div class="pills">
+    <span class="pill" id="pill-tcp">ESP32 altavoz</span>
+    <span class="pill" id="pill-radio">RADIO</span>
+    <span class="pill" id="pill-vision">VISION</span>
+    <span class="pill" id="pill-voz">VOZ</span>
+  </div>
+
+  <div class="section-title">🎵 Sonidos</div>
+  <div class="grid-2">
+    <button class="btn" onclick="beep(440,200)">♩ 440 Hz</button>
+    <button class="btn" onclick="beep(880,200)">♩ 880 Hz</button>
+    <button class="btn" onclick="beep(1200,300)">♩ Alta</button>
+    <button class="btn" onclick="beep(220,400)">♩ Baja</button>
+    <button class="btn wide" onclick="beepSeq()">🎵 Secuencia</button>
+    <button class="btn danger wide" onclick="stopAudio()">⏹ Parar</button>
+  </div>
+
+  <div class="section-title">🗣️ Texto a voz</div>
+  <div class="input-group">
+    <input id="say-text" type="text" placeholder="Escribe algo..." onkeydown="if(event.key==='Enter')say()">
+    <button class="btn primary" onclick="say()">Decir (rápido)</button>
+  </div>
+  <div class="input-group">
+    <button class="btn success wide" onclick="sayClonada()">🧬 Decir con voz clonada</button>
+  </div>
+
+  <div class="section-title">📻 Radio</div>
+  <div class="input-group">
+    <input id="radio-url" type="text" value="RADIO_DEFAULT_PLACEHOLDER">
+    <button class="btn success" onclick="radioOn()">▶</button>
+    <button class="btn danger" onclick="radioOff()">■</button>
+  </div>
+
+  <div class="section-title">📷 Cámara y Visión</div>
+  <button class="btn primary" onclick="toggleCamera()">📷 Activar cámara</button>
+  <button class="btn success" onclick="describe()" style="margin-left:10px;">🧠 Describir lo que ve</button>
+  <div class="video-container" id="videoContainer" style="display:none;">
+    <img id="camImg" src="/camera_proxy" alt="Cámara ESP32">
+    <br><button class="btn" onclick="refreshCamera()">🔄 Actualizar</button>
+  </div>
+  <div id="desc-box">📝 Descripción aparecerá aquí</div>
+
+  <div id="log"></div>
+</div>
+<script src="/web/app.js"></script>
+</body>
+</html>

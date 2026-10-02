@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""
+VISTA · GATEWAY SERVICE  (:8080)
+
+Reescritura completa. Arregla dos bugs graves de la versión anterior:
+
+1) "⚠️ Longitud inválida" en el ESP32
+   Causa: varias peticiones (beep, say, /internal/send_pcm) escribían
+   a la vez en el mismo socket TCP del altavoz sin serializar el acceso.
+   Los bytes de dos mensajes distintos se entrelazaban, y el ESP32
+   interpretaba trozos de PCM como si fueran la cabecera de 4 bytes
+   (longitud), dando números absurdos.
+   Arreglo: un asyncio.Lock global (`_spk_lock`) envuelve TODA escritura
+   al socket del altavoz (cabecera + payload van en una sola operación
+   atómica). Nunca hay dos escrituras concurrentes.
+
+2) Cámara / descripción para invidentes
+   /describe ahora, además de devolver el texto a la web, lo manda
+   automáticamente a voz/ /speak con la voz clonada (forward=true),
+   que a su vez lo reenvía sola al altavoz vía /internal/send_pcm.
+   Así basta con pulsar "Describir" para que lo lea en voz alta.
+
+Endpoints (deben coincidir con gateway/web/app.js):
+  GET  /                    -> web/index.html
+  GET  /web/*                -> estáticos (css/js)
+  GET  /camera_proxy         -> proxy de http://ESP32_IP/capture
+  POST /describe              -> pide a vision/ que describa el frame actual
+                                  y lo lee con voz clonada
+  POST /cmd                   -> {cmd: beep|say|stop|radio_on|radio_off}
+  POST /internal/send_pcm     -> usado por voz/service.py, reenvía al altavoz
+  GET  /stats                 -> estado para el panel web
+"""
+import asyncio
+import logging
+import math
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+from aiohttp import web, ClientSession, ClientTimeout
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+from _vista_config import cfg  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(levelname)-7s  [gateway] %(message)s', datefmt='%H:%M:%S')
+log = logging.getLogger("gateway")
+
+# ── Config (services.env) ──────────────────────────────────────
+GATEWAY_PORT   = int(cfg.get("GATEWAY_PORT", 8080))
+TCP_SPK_PORT   = int(cfg.get("TCP_SPK_PORT", 5002))
+VISION_PORT    = int(cfg.get("VISION_PORT", 8081))
+VOZ_PORT       = int(cfg.get("VOZ_PORT", 8082))
+MUSICA_PORT    = int(cfg.get("MUSICA_PORT", 8083))
+SAMPLE_RATE    = int(cfg.get("SAMPLE_RATE", 16000))
+ESP32_IP_CFG   = cfg.get("ESP32_IP", "")
+
+VISION_URL = f"http://localhost:{VISION_PORT}"
+VOZ_URL    = f"http://localhost:{VOZ_PORT}"
+MUSICA_URL = f"http://localhost:{MUSICA_PORT}"
+
+WEB_DIR = Path(__file__).resolve().parent / "web"
+
+MAX_PCM_BYTES = 8 * 1024 * 1024  # límite de cordura para un bloque de audio
+
+# ── Estado compartido del altavoz ESP32 ─────────────────────────
+_esp32_ip: str | None = ESP32_IP_CFG or None
+_spk_writer: asyncio.StreamWriter | None = None
+_spk_lock = asyncio.Lock()
+_radio_active = False
+
+
+async def send_pcm_to_esp32(pcm: bytes) -> bool:
+    """Envía un bloque PCM estéreo 16-bit al altavoz, con framing atómico.
+    Formato: 4 bytes little-endian (longitud) + PCM. TODO en un único
+    write bajo lock, para que nunca se entrelace con otro envío."""
+    global _spk_writer
+    if not pcm:
+        return False
+    if len(pcm) > MAX_PCM_BYTES:
+        log.warning(f"PCM demasiado grande ({len(pcm)} bytes), descartado")
+        return False
+
+    async with _spk_lock:
+        if _spk_writer is None or _spk_writer.is_closing():
+            log.warning("No hay ESP32 conectada al altavoz, descarto audio")
+            return False
+        try:
+            header = struct.pack("<I", len(pcm))
+            _spk_writer.write(header + pcm)
+            await _spk_writer.drain()
+            return True
+        except Exception as e:
+            log.warning(f"Error enviando PCM al altavoz: {e}")
+            try:
+                _spk_writer.close()
+            except Exception:
+                pass
+            _spk_writer = None
+            return False
+
+
+async def _tcp_client_connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """El ESP32 se conecta a nosotros como cliente TCP (ver .ino tcp_audio_task)."""
+    global _spk_writer, _esp32_ip
+    peer = writer.get_extra_info("peername")
+    ip = peer[0] if peer else "?"
+    log.info(f"🔌 ESP32 conectada por TCP desde {ip}")
+
+    async with _spk_lock:
+        if _spk_writer is not None and not _spk_writer.is_closing():
+            try:
+                _spk_writer.close()
+            except Exception:
+                pass
+        _spk_writer = writer
+    _esp32_ip = ip  # auto-detección de IP, como indica el README
+
+    try:
+        # El ESP32 no nos manda nada por este socket, solo mantenemos viva
+        # la conexión y detectamos si se cae.
+        while True:
+            data = await reader.read(1024)
+            if not data:
+                break
+    except Exception:
+        pass
+    finally:
+        log.info("🔌 ESP32 desconectada del altavoz")
+        async with _spk_lock:
+            if _spk_writer is writer:
+                _spk_writer = None
+
+
+# ── Generación de audio local (beep / say rápido) ───────────────
+def gen_beep_pcm(freq: float, ms: int) -> bytes:
+    n = int(SAMPLE_RATE * ms / 1000)
+    t = np.arange(n) / SAMPLE_RATE
+    wave = (0.5 * np.sin(2 * math.pi * freq * t)).astype(np.float32)
+    fade = min(int(SAMPLE_RATE * 0.005), n // 4) or 1
+    ramp = np.linspace(0, 1, fade)
+    wave[:fade] *= ramp
+    wave[-fade:] *= ramp[::-1]
+    mono = (wave * 32767).astype(np.int16)
+    stereo = np.empty(len(mono) * 2, dtype=np.int16)
+    stereo[0::2] = mono
+    stereo[1::2] = mono
+    return stereo.tobytes()
+
+
+def gen_espeak_pcm(texto: str) -> bytes | None:
+    """TTS rápido (robótico) para el botón 'say', sin pasar por voz/ (XTTS)."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+    try:
+        subprocess.run(["espeak-ng", "-v", "es", "-s", "150", "-w", tmp, texto],
+                        check=True, capture_output=True, timeout=15)
+        samples, sr = sf.read(tmp, dtype="float32")
+        if samples.ndim > 1:
+            samples = samples.mean(axis=1)
+        if sr != SAMPLE_RATE:
+            import scipy.signal as ss
+            from math import gcd
+            g = gcd(SAMPLE_RATE, sr)
+            samples = ss.resample_poly(samples, SAMPLE_RATE // g, sr // g).astype(np.float32)
+        mono = (np.clip(samples, -1, 1) * 32767).astype(np.int16)
+        stereo = np.empty(len(mono) * 2, dtype=np.int16)
+        stereo[0::2] = mono
+        stereo[1::2] = mono
+        return stereo.tobytes()
+    except Exception as e:
+        log.warning(f"espeak-ng falló: {e}")
+        return None
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+# ── Handlers HTTP ────────────────────────────────────────────────
+async def handle_index(request):
+    idx = WEB_DIR / "index.html"
+    if idx.exists():
+        return web.FileResponse(idx)
+    return web.Response(text="Falta web/index.html", status=404)
+
+
+async def handle_camera_proxy(request):
+    if not _esp32_ip:
+        return web.Response(text="ESP32 aún no conectada", status=503)
+    url = f"http://{_esp32_ip}/capture"
+    try:
+        timeout = ClientTimeout(total=4)
+        async with ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return web.Response(text=f"ESP32 respondió {resp.status}", status=502)
+                data = await resp.read()
+                return web.Response(body=data, content_type="image/jpeg",
+                                     headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        log.warning(f"camera_proxy: no se pudo contactar {url}: {e}")
+        return web.Response(text=f"No se pudo contactar con la cámara: {e}", status=502)
+
+
+async def handle_describe(request):
+    if not _esp32_ip:
+        return web.json_response({"error": "ESP32 aún no conectada"}, status=503)
+    try:
+        timeout = ClientTimeout(total=30)
+        async with ClientSession(timeout=timeout) as session:
+            async with session.post(f"{VISION_URL}/describe", json={"esp32_ip": _esp32_ip}) as resp:
+                data = await resp.json()
+    except Exception as e:
+        log.warning(f"describe: vision/ no respondió: {e}")
+        return web.json_response({"error": f"vision/ no disponible: {e}"}, status=502)
+
+    descripcion = data.get("descripcion") or data.get("description") or data.get("text")
+    if not descripcion:
+        return web.json_response({"error": data.get("error", "sin descripción")}, status=500)
+
+    # Leerlo en voz alta con la voz clonada, en segundo plano (no bloquea la respuesta)
+    asyncio.create_task(_hablar_descripcion(descripcion))
+
+    return web.json_response({"descripcion": descripcion})
+
+
+async def _hablar_descripcion(texto: str):
+    try:
+        timeout = ClientTimeout(total=60)
+        async with ClientSession(timeout=timeout) as session:
+            async with session.post(f"{VOZ_URL}/speak", json={"text": texto, "forward": True}) as resp:
+                if resp.status != 200:
+                    log.warning(f"voz/ /speak devolvió {resp.status}")
+    except Exception as e:
+        log.warning(f"No se pudo pedir a voz/ que leyera la descripción: {e}")
+
+
+async def handle_cmd(request):
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "err": "bad json"}, status=400)
+
+    cmd = body.get("cmd")
+    global _radio_active
+
+    if cmd == "beep":
+        freq = float(body.get("freq", 440))
+        ms = int(body.get("ms", 200))
+        pcm = gen_beep_pcm(freq, ms)
+        ok = await send_pcm_to_esp32(pcm)
+        return web.json_response({"ok": ok})
+
+    elif cmd == "say":
+        texto = (body.get("text") or "").strip()
+        if not texto:
+            return web.json_response({"ok": False, "err": "texto vacío"}, status=400)
+        pcm = await asyncio.to_thread(gen_espeak_pcm, texto)
+        if pcm is None:
+            return web.json_response({"ok": False, "err": "espeak-ng falló"}, status=500)
+        ok = await send_pcm_to_esp32(pcm)
+        return web.json_response({"ok": ok})
+
+    elif cmd == "stop":
+        # No hay reproducción en curso que cortar a medio camino (cada envío
+        # es un bloque cerrado), pero dejamos el hook por si se añade un
+        # modo de streaming continuo más adelante.
+        return web.json_response({"ok": True})
+
+    elif cmd == "radio_on":
+        url = (body.get("url") or "").strip()
+        if not url:
+            return web.json_response({"ok": False, "err": "falta url"}, status=400)
+        try:
+            timeout = ClientTimeout(total=10)
+            async with ClientSession(timeout=timeout) as session:
+                async with session.post(f"{MUSICA_URL}/radio/on", json={"url": url}) as resp:
+                    data = await resp.json()
+                    if resp.status != 200:
+                        return web.json_response({"ok": False, "err": data.get("error", "musica/ error")}, status=502)
+        except Exception as e:
+            return web.json_response({"ok": False, "err": f"musica/ no disponible: {e}"}, status=502)
+        _radio_active = True
+        return web.json_response({"ok": True})
+
+    elif cmd == "radio_off":
+        try:
+            timeout = ClientTimeout(total=10)
+            async with ClientSession(timeout=timeout) as session:
+                async with session.post(f"{MUSICA_URL}/radio/off") as resp:
+                    await resp.json()
+        except Exception as e:
+            log.warning(f"radio_off: {e}")
+        _radio_active = False
+        return web.json_response({"ok": True})
+
+    return web.json_response({"ok": False, "err": f"cmd desconocido: {cmd}"}, status=400)
+
+
+async def handle_internal_send_pcm(request):
+    """Usado por voz/service.py: POST con el PCM crudo en el body."""
+    data = await request.read()
+    ok = await send_pcm_to_esp32(data)
+    return web.json_response({"ok": ok})
+
+
+async def handle_stats(request):
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        server_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        server_ip = "127.0.0.1"
+
+    tcp_ok = _spk_writer is not None and not _spk_writer.is_closing()
+    return web.json_response({
+        "server_ip": server_ip,
+        "esp32_ip": _esp32_ip,
+        "tcp_spk": tcp_ok,
+        "radio": _radio_active,
+    })
+
+
+async def start_tcp_server(app):
+    server = await asyncio.start_server(_tcp_client_connected, "0.0.0.0", TCP_SPK_PORT)
+    app["tcp_server"] = server
+    log.info(f"✅ TCP altavoz escuchando en :{TCP_SPK_PORT} (esperando a la ESP32)")
+
+
+async def stop_tcp_server(app):
+    server = app.get("tcp_server")
+    if server:
+        server.close()
+        await server.wait_closed()
+
+
+def main():
+    app = web.Application(client_max_size=20 * 1024 * 1024)
+
+    app.router.add_get("/", handle_index)
+    app.router.add_get("/camera_proxy", handle_camera_proxy)
+    app.router.add_post("/describe", handle_describe)
+    app.router.add_post("/cmd", handle_cmd)
+    app.router.add_post("/internal/send_pcm", handle_internal_send_pcm)
+    app.router.add_get("/stats", handle_stats)
+    if WEB_DIR.exists():
+        app.router.add_static("/web/", path=WEB_DIR, name="web")
+
+    app.on_startup.append(start_tcp_server)
+    app.on_cleanup.append(stop_tcp_server)
+
+    log.info(f"🌐 gateway/ escuchando en :{GATEWAY_PORT}")
+    web.run_app(app, host="0.0.0.0", port=GATEWAY_PORT, print=None)
+
+
+if __name__ == "__main__":
+    main()
