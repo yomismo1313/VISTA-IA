@@ -11,6 +11,7 @@ VISTA-IA/
 ├── gateway/               :8080  web + proxy cámara + TCP altavoz ESP32
 │   └── web/                html/css/js del panel de control
 ├── vision/                :8081  YOLO + descripción de imagen (Ollama/LLaVA)
+├── stt                    :5010  Speech-to-Text (faster-whisper + CUDA)
 ├── voz/                   :8082  Whisper (STT) + XTTS voz clonada (TTS)
 ├── musica/                :8083  radio (UDP → ESP32) + biblioteca (SQLite)
 ├── cerebro/                (sin puerto) bucle de escucha, orquesta todo
