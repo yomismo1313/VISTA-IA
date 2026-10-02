@@ -7,7 +7,7 @@ puertos) vive en un único archivo: `services.env`.
 
 ```
 VISTA-IA/
-├── services.env          ← config compartida (¡edítala aquí, no en el código!)
+├── services.env          ← config compartida (edítalo)
 ├── gateway/               :8080  web + proxy cámara + TCP altavoz ESP32
 │   └── web/                html/css/js del panel de control
 ├── vision/                :8081  YOLO + descripción de imagen (Ollama/LLaVA)
