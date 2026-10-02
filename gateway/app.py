@@ -272,12 +272,11 @@ async def _play_local(pcm):
             pass
     try:
         local_audio_proc = await asyncio.create_subprocess_exec(
-            "aplay", "-q",
-            "-D", AUDIO_LOCAL_DEVICE,
-            "-f", "S16_LE",
-            "-r", str(SAMPLE_RATE),
-            "-c", "2",
-            "-t", "raw",
+            "paplay",
+            "--raw",
+            "--format=s16le",
+            f"--rate={SAMPLE_RATE}",
+            "--channels=2",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
