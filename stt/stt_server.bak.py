@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-VISTA · STT SERVER · v5 (2026-10)
+VISTA · STT SERVER · v4 (2026-10)
 
 Servidor TCP :5010 → faster-whisper → router de comandos.
 
 Comandos soportados:
-  VISTA que ves            → descripción vía vision:8081 (con fallbacks de fuente)
+  VISTA que ves            → captura del ESP32 + descripción (moondream)
   VISTA dime <pregunta>    → conversación con memoria (llama3.2)
   VISTA cállate            → apaga conversación y limpia historial
-  VISTA graba              → graba 2 min de vídeo
+  VISTA graba              → graba 2 min de vídeo del ESP32/PC
   VISTA pon la radio       → RADIOLE_ASO_OSUNA con mpv
   VISTA pon música         → canción aleatoria de musica.db con mpv
   VISTA sube el volumen    → nivel 1 → 2 → 3
@@ -16,9 +16,8 @@ Comandos soportados:
 
 Variables de entorno (todas opcionales):
   STT_PORT, STT_MODEL, STT_USE_GPU, STT_GAIN_DB, STT_SILENCE_RMS,
-  STT_CHUNK_SECONDS, GATEWAY_SPEAK, VISION_PORT, OLLAMA_URL,
-  OLLAMA_MODEL, LLAVA_MODEL, ESP32_IP, RADIO_URL, MUSICA_DB,
-  VOLUME_BACKEND
+  STT_CHUNK_SECONDS, GATEWAY_SPEAK, OLLAMA_URL, OLLAMA_MODEL,
+  LLAVA_MODEL, ESP32_IP, RADIO_URL, MUSICA_DB, VOLUME_BACKEND
 """
 # ═══════════════════════════════════════════════════════════════
 #  PRE-CARGA DE CUDA ANTES DE IMPORTAR ctranslate2
@@ -74,7 +73,7 @@ _preload_all_cuda_libs()
 # ═══════════════════════════════════════════════════════════════
 #  IMPORTS
 # ═══════════════════════════════════════════════════════════════
-import re, socket, sqlite3, subprocess, threading, time
+import base64, re, socket, sqlite3, subprocess, threading, time
 from pathlib import Path
 from typing import Optional
 
@@ -103,11 +102,9 @@ GAIN_DB         = float(os.environ.get("STT_GAIN_DB", "20"))
 SILENCE_RMS     = float(os.environ.get("STT_SILENCE_RMS", "0.0005"))
 
 GATEWAY_SPEAK   = os.environ.get("GATEWAY_SPEAK", "http://127.0.0.1:8080/speak")
-VISION_PORT     = int(os.environ.get("VISION_PORT", "8081"))
-VISION_URL      = os.environ.get("VISION_URL", f"http://127.0.0.1:{VISION_PORT}/describe")
 OLLAMA_URL      = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
 OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "llama3.2")
-LLAVA_MODEL     = os.environ.get("LLAVA_MODEL", "moondream")
+LLAVA_MODEL     = os.environ.get("LLAVA_MODEL", "moondream")   # moondream describe mejor
 
 ESP32_IP        = os.environ.get("ESP32_IP", "192.168.1.10")
 RADIO_URL       = os.environ.get(
@@ -118,14 +115,16 @@ MUSICA_DB       = os.environ.get(
     "MUSICA_DB",
     os.path.expanduser("~/Escritorio/VISTA-IA/data/db/musica.db"),
 )
+VIDEO_DEVICE_ESP = f"http://{ESP32_IP}/capture"
 
 # Volumen: 'pipewire' (wpctl), 'alsa' (amixer), 'esp32' (envía al ESP32), 'none'
 VOLUME_BACKEND  = os.environ.get("VOLUME_BACKEND", "pipewire").lower()
 VOLUME_SINK     = os.environ.get("VOLUME_SINK", "@DEFAULT_AUDIO_SINK@")
 VOLUME_ALSA_CTRL= os.environ.get("VOLUME_ALSA_CTRL", "Master")
 
-VOL_LEVELS      = [30, 60, 100]
-_vol_idx_global = {"nivel": 1}
+# 3 niveles de volumen (en %)
+VOL_LEVELS      = [30, 60, 100]      # bajo, medio, alto
+_vol_idx_global = {"nivel": 1}        # 1 = medio por defecto
 
 # Wake words y sinónimos
 WAKE_WORDS = ("vista", "bista", "pista", "vista,", "bista,",
@@ -210,6 +209,7 @@ def hablar(texto: str):
 #  VOLUMEN · 3 NIVELES
 # ═══════════════════════════════════════════════════════════════
 def _aplicar_volumen(porcentaje: int):
+    """Aplica el nivel actual según VOLUME_BACKEND."""
     global _vol_idx_global
     if VOLUME_BACKEND == "pipewire":
         try:
@@ -233,6 +233,7 @@ def _aplicar_volumen(porcentaje: int):
             print(f"⚠️ amixer: {e}", flush=True)
     elif VOLUME_BACKEND == "esp32":
         try:
+            # Envía un POST al ESP32 con el nivel (necesita endpoint /volume en el .ino)
             r = requests.post(
                 f"http://{ESP32_IP}/volume",
                 json={"percent": porcentaje},
@@ -266,54 +267,59 @@ def cmd_baja_volumen():
 #  COMANDOS
 # ═══════════════════════════════════════════════════════════════
 def cmd_que_ves():
-    """
-    Delega en vision:8081, que ya tiene los fallbacks de fuente de frame
-    (gateway /last_frame → /camera_proxy → ESP32 directo) y hace la
-    descripción con LLaVA/moondream. Devuelve JSON: {descripcion, objetos}.
-    """
-    print(f"📷 Pidiendo descripción a vision:{VISION_PORT}...", flush=True)
+    """Solo ESP32. Prompt tipo 'como si el usuario fuera ciego'."""
+    print(f"📷 Capturando del ESP32 ({ESP32_IP})...", flush=True)
+    img = "/tmp/vista_que_ves.jpg"
 
-    try:
-        r = requests.post(VISION_URL, json={}, timeout=180)
-    except requests.exceptions.Timeout:
-        print("   · vision: timeout", flush=True)
-        hablar("La visión está tardando demasiado.")
-        return
-    except Exception as e:
-        print(f"⚠️ vision: {type(e).__name__}: {e}", flush=True)
-        hablar("No puedo conectar con el módulo de visión.")
-        return
+    capturado = False
+    for intento in (1, 2, 3):
+        try:
+            r = requests.get(VIDEO_DEVICE_ESP, timeout=15)
+            print(f"   · intento {intento}: HTTP {r.status_code}, "
+                  f"{len(r.content)} bytes", flush=True)
+            if r.ok and len(r.content) > 2000:
+                Path(img).write_bytes(r.content)
+                capturado = True
+                break
+        except requests.exceptions.Timeout:
+            print(f"   · intento {intento}: timeout", flush=True)
+        except Exception as e:
+            print(f"   · intento {intento}: {type(e).__name__}: {e}", flush=True)
+        time.sleep(1)
 
-    if r.status_code == 503:
-        print(f"   · vision 503: {r.text[:200]}", flush=True)
-        hablar("No he podido capturar la imagen.")
-        return
-
-    if not r.ok:
-        print(f"   · vision HTTP {r.status_code}: {r.text[:200]}", flush=True)
-        hablar("La visión no responde ahora mismo.")
+    if not capturado:
+        hablar("No he podido acceder a la cámara del ESP32.")
         return
 
     try:
-        data = r.json()
+        b64 = base64.b64encode(Path(img).read_bytes()).decode()
+        r = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": LLAVA_MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        "Eres los ojos de una persona ciega. Describe la imagen "
+                        "con detalle y de forma útil: qué hay, dónde está cada "
+                        "cosa (izquierda, derecha, delante, fondo), colores, "
+                        "personas, objetos, texto visible y distancias "
+                        "aproximadas. Empieza por lo más importante. "
+                        "Sé concreto. No inventes lo que no ves."
+                    ),
+                    "images": [b64],
+                }],
+                "stream": False,
+                "options": {"temperature": 0.2, "top_p": 0.9},
+            },
+            timeout=180,
+        )
+        desc = r.json().get("message", {}).get("content", "").strip()
+        print(f"👁️  {desc}", flush=True)
+        hablar(desc or "No he podido describir la imagen.")
     except Exception as e:
-        print(f"⚠️ vision json: {e}: {r.text[:200]}", flush=True)
-        hablar("No he podido entender la respuesta de la visión.")
-        return
-
-    if "error" in data:
-        print(f"   · vision error: {data['error']}", flush=True)
-        hablar("No he podido analizar la imagen.")
-        return
-
-    desc = (data.get("descripcion") or "").strip()
-    if not desc:
-        print(f"   · respuesta sin descripción: {data!r}", flush=True)
-        hablar("No he podido describir la imagen.")
-        return
-
-    print(f"👁️  {desc}", flush=True)
-    hablar(desc)
+        print(f"⚠️ visión: {type(e).__name__}: {e}", flush=True)
+        hablar("No puedo analizar la imagen ahora mismo.")
 
 
 def cmd_graba_video(minutos: float = 2.0):
@@ -322,6 +328,7 @@ def cmd_graba_video(minutos: float = 2.0):
     print(f"🎥 Grabando {minutos} min → {out}", flush=True)
     hablar(f"Grabando {minutos} minutos de vídeo.")
     try:
+        # Intenta primero la cámara del ESP32
         cmd = [
             "ffmpeg", "-y",
             "-f", "mjpeg", "-i", f"http://{ESP32_IP}:81/stream",
@@ -349,6 +356,7 @@ def cmd_graba_video(minutos: float = 2.0):
 
 
 def _reproducir(url: str):
+    """Lanza mpv contra una URL o archivo."""
     try:
         subprocess.Popen(
             ["mpv", "--no-video", "--really-quiet", url],
@@ -405,19 +413,15 @@ def cmd_pon_musica():
 # ═══════════════════════════════════════════════════════════════
 #  CONVERSACIÓN CON MEMORIA
 # ═══════════════════════════════════════════════════════════════
-MAX_HISTORIAL = 20
+MAX_HISTORIAL = 20   # mensajes (user+assistant) por cliente
 
 def _responder_ollama(texto: str, addr=None):
+    """Manda texto a Ollama con el historial del cliente (memoria)."""
     with estado_lock:
         hist = estado_cliente.get(addr, {}).get("messages", []) \
                if addr is not None else []
 
-    mensajes = [
-        {"role": "system",
-         "content": ("Eres VISTA, un asistente de voz en español. "
-                     "Responde SIEMPRE en español, de forma breve, natural "
-                     "y directa. No uses inglés salvo que el usuario lo pida.")}
-    ] + hist + [{"role": "user", "content": texto}]
+    mensajes = hist + [{"role": "user", "content": texto}]
 
     try:
         r = requests.post(
@@ -434,6 +438,7 @@ def _responder_ollama(texto: str, addr=None):
         print(f"🤖 {resp[:200]}{'…' if len(resp) > 200 else ''}", flush=True)
         hablar(resp or "No he sabido qué responder.")
 
+        # Guarda el historial (recortado)
         if addr is not None:
             with estado_lock:
                 entry = estado_cliente.setdefault(addr, {"modo": "idle", "messages": []})
@@ -455,8 +460,7 @@ def contiene_wake(texto: str) -> bool:
 def quitar_wake(texto: str) -> str:
     t = texto
     for _ in range(2):
-        t2 = re.sub(r"^\s*(vista|bista|pista|vis\s*ta|bis\s*ta|"
-                    r"hey\s+jarvis|jarvis|jervis)[,\s]*",
+        t2 = re.sub(r"^\s*(vista|bista|pista|vis\s*ta|bis\s*ta)[,\s]*",
                     "", t, flags=re.IGNORECASE)
         if t2 == t:
             break
@@ -494,20 +498,12 @@ def enrutar(texto: str, addr=None):
         return
 
     if RX_DIME.search(t) or RX_DIME.search(texto.lower()):
+        # Si venía de wake word "VISTA dime …", entra en modo conversación
         if addr is not None:
             with estado_lock:
                 entry = estado_cliente.setdefault(addr, {"modo": "idle", "messages": []})
                 entry["modo"] = "conversacion"
         _responder_ollama(t or "Hola", addr)
-        return
-
-    # Fallback: si no matchea nada, va a Ollama en modo conversación
-    if t:
-        if addr is not None:
-            with estado_lock:
-                entry = estado_cliente.setdefault(addr, {"modo": "idle", "messages": []})
-                entry["modo"] = "conversacion"
-        _responder_ollama(t, addr)
         return
 
     hablar("No he entendido el comando.")
@@ -516,7 +512,7 @@ def enrutar(texto: str, addr=None):
 # ═══════════════════════════════════════════════════════════════
 #  ESTADO POR CLIENTE
 # ═══════════════════════════════════════════════════════════════
-estado_cliente = {}
+estado_cliente = {}     # addr -> {"modo": "idle"|"conversacion", "messages": [...]}
 estado_lock = threading.Lock()
 
 
@@ -543,12 +539,14 @@ def _procesar_buffer(audio: np.ndarray, addr, tag: str):
 
     low = texto.lower()
 
+    # Modo conversación: todo va a Ollama, salvo "cállate"
     if modo == "conversacion":
         if RX_CALLATE.search(low):
             with estado_lock:
                 estado_cliente[addr] = {"modo": "idle", "messages": []}
             hablar("Vale, hasta luego.")
             return True
+        # ¿Ha dicho otro comando "VISTA ..." dentro de la conversación?
         if contiene_wake(texto):
             threading.Thread(target=enrutar, args=(texto, addr), daemon=True).start()
             return True
@@ -556,6 +554,7 @@ def _procesar_buffer(audio: np.ndarray, addr, tag: str):
                          daemon=True).start()
         return True
 
+    # Modo normal
     if contiene_wake(texto):
         threading.Thread(target=enrutar, args=(texto, addr), daemon=True).start()
         return True
@@ -624,9 +623,8 @@ def main():
     print(f"   Ganancia: +{GAIN_DB:.1f} dB | silencio_rms={SILENCE_RMS}", flush=True)
     print(f"   Wake words: {WAKE_WORDS}", flush=True)
     print(f"   Gateway:    {GATEWAY_SPEAK}", flush=True)
-    print(f"   Vision:     {VISION_URL}", flush=True)
     print(f"   Ollama:     {OLLAMA_URL} ({OLLAMA_MODEL}, {LLAVA_MODEL})", flush=True)
-    print(f"   ESP32 IP:   {ESP32_IP}", flush=True)
+    print(f"   ESP32 cám:  {VIDEO_DEVICE_ESP}", flush=True)
     print(f"   Radio:      {RADIO_URL}", flush=True)
     print(f"   Música DB:  {MUSICA_DB} "
           f"({'OK' if Path(MUSICA_DB).exists() else 'no existe'})", flush=True)

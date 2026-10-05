@@ -1,3 +1,7 @@
-requests
+# VISTA · cerebro
+sounddevice
 numpy
 soundfile
+requests
+onnxruntime
+openwakeword
